@@ -133,7 +133,7 @@ def set_grayscale(enabled):
         # 1x zoom, whole screen, no lens -> no visible magnification, just desaturate.
         _gset(MAGNIFIER, "mag-factor", "1.0")
         _gset(MAGNIFIER, "lens-mode", "false")
-        _gset(MAGNIFIER, "screen-position", "'full'")
+        _gset(MAGNIFIER, "screen-position", "'full-screen'")
         _gset(MAGNIFIER, "color-saturation", "0.0")
         _gset(A11Y_APPS, "screen-magnifier-enabled", "true")
     else:
