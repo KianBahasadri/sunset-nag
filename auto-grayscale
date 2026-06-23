@@ -1,0 +1,200 @@
+#!/usr/bin/env python3
+"""auto-grayscale: make the GNOME (Wayland) screen grayscale between sunset and
+sunrise.
+
+Grayscale is achieved with GNOME's accessibility magnifier at 1x zoom with
+color-saturation set to 0 (full desaturation). No external packages are needed:
+sunrise/sunset are computed locally with the standard sunrise equation.
+
+Subcommands:
+  apply    Compute the correct state for "now" and apply it (used by the timer).
+  on       Force grayscale on.
+  off      Force grayscale off (full color).
+  status   Print today's sun times and current state.
+  times    Print today's sunrise and sunset.
+
+Run `apply` on a timer (see auto-grayscale.timer) to keep the screen in the
+right state. It is idempotent: it only touches gsettings when a change is
+needed.
+"""
+
+import math
+import subprocess
+import sys
+from datetime import datetime, timezone
+
+# ---------------------------------------------------------------------------
+# Configuration -- edit these for your location.
+# Latitude is north-positive, longitude is east-positive.
+# Toronto, ON:
+LAT = 43.6532
+LON = -79.3832
+# Sun altitude (degrees) that counts as sunrise/sunset. -0.833 is the standard
+# value (sun's upper limb at the horizon, accounting for refraction).
+# Use -6 for civil twilight if you want the switch a bit later/earlier.
+SUN_ALTITUDE = -0.833
+# ---------------------------------------------------------------------------
+
+MAGNIFIER = "org.gnome.desktop.a11y.magnifier"
+A11Y_APPS = "org.gnome.desktop.a11y.applications"
+
+
+def sun_times(lat, lon, year, month, day):
+    """Return (sunrise, sunset) as timezone-aware UTC datetimes for the given
+    calendar date, or (None, None) if the sun does not rise/set that day.
+
+    Based on the sunrise equation (https://en.wikipedia.org/wiki/Sunrise_equation),
+    accurate to roughly a minute -- far better than needed here.
+    """
+    # Julian Day Number for the Gregorian date (integer, refers to noon UTC).
+    a = (14 - month) // 12
+    y = year + 4800 - a
+    m = month + 12 * a - 3
+    jdn = (
+        day
+        + (153 * m + 2) // 5
+        + 365 * y
+        + y // 4
+        - y // 100
+        + y // 400
+        - 32045
+    )
+
+    n = jdn - 2451545 + 0.0008          # days since 2000-01-01 12:00 (+ leap corr.)
+    j_star = n - lon / 360.0            # mean solar time (lon east-positive)
+
+    M = (357.5291 + 0.98560028 * j_star) % 360          # solar mean anomaly
+    Mr = math.radians(M)
+    C = 1.9148 * math.sin(Mr) + 0.0200 * math.sin(2 * Mr) + 0.0003 * math.sin(3 * Mr)
+    lam = (M + C + 180 + 102.9372) % 360                # ecliptic longitude
+    lamr = math.radians(lam)
+
+    j_transit = 2451545.0 + j_star + 0.0053 * math.sin(Mr) - 0.0069 * math.sin(2 * lamr)
+
+    sin_d = math.sin(lamr) * math.sin(math.radians(23.4397))   # solar declination
+    cos_d = math.cos(math.asin(sin_d))
+
+    latr = math.radians(lat)
+    cos_w = (
+        math.sin(math.radians(SUN_ALTITUDE)) - math.sin(latr) * sin_d
+    ) / (math.cos(latr) * cos_d)
+    if cos_w > 1:
+        return None, None       # sun never rises (polar night)
+    if cos_w < -1:
+        return None, None       # sun never sets (polar day)
+    w = math.degrees(math.acos(cos_w))
+
+    def jd_to_dt(jd):
+        unix = (jd - 2440587.5) * 86400.0
+        return datetime.fromtimestamp(unix, tz=timezone.utc)
+
+    return jd_to_dt(j_transit - w / 360.0), jd_to_dt(j_transit + w / 360.0)
+
+
+def todays_sun_times():
+    """(sunrise, sunset) UTC datetimes for the current *local* date."""
+    local_now = datetime.now().astimezone()
+    return sun_times(LAT, LON, local_now.year, local_now.month, local_now.day)
+
+
+def is_night(now=None):
+    """True if grayscale should be on right now (before sunrise or after sunset)."""
+    if now is None:
+        now = datetime.now(timezone.utc)
+    sunrise, sunset = todays_sun_times()
+    if sunrise is None or sunset is None:
+        return False            # polar edge case: leave color as-is, do nothing
+    return now < sunrise or now >= sunset
+
+
+def _gset(schema, key, value):
+    subprocess.run(["gsettings", "set", schema, key, value], check=True)
+
+
+def _gget(schema, key):
+    return subprocess.run(
+        ["gsettings", "get", schema, key],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+
+
+def current_grayscale():
+    """True if the screen is currently grayscale (magnifier on + saturation 0)."""
+    try:
+        enabled = _gget(A11Y_APPS, "screen-magnifier-enabled") == "true"
+        sat = float(_gget(MAGNIFIER, "color-saturation"))
+    except (subprocess.CalledProcessError, ValueError):
+        return False
+    return enabled and sat < 0.5
+
+
+def set_grayscale(enabled):
+    if enabled:
+        # 1x zoom, whole screen, no lens -> no visible magnification, just desaturate.
+        _gset(MAGNIFIER, "mag-factor", "1.0")
+        _gset(MAGNIFIER, "lens-mode", "false")
+        _gset(MAGNIFIER, "screen-position", "'full'")
+        _gset(MAGNIFIER, "color-saturation", "0.0")
+        _gset(A11Y_APPS, "screen-magnifier-enabled", "true")
+    else:
+        _gset(A11Y_APPS, "screen-magnifier-enabled", "false")
+        _gset(MAGNIFIER, "color-saturation", "1.0")
+
+
+def cmd_apply(dry_run=False):
+    want = is_night()
+    have = current_grayscale()
+    if want == have:
+        print(f"no change: grayscale {'on' if have else 'off'}")
+        return
+    print(f"{'would set' if dry_run else 'setting'} grayscale {'on' if want else 'off'}")
+    if not dry_run:
+        try:
+            set_grayscale(want)
+        except (subprocess.CalledProcessError, FileNotFoundError) as e:
+            # No reachable GNOME session bus (e.g. ran outside a session).
+            # Nothing to do -- exit quietly so the timer isn't marked failed.
+            print(f"skipped: gsettings not reachable ({e})")
+
+
+def _fmt(dt):
+    return "n/a" if dt is None else dt.astimezone().strftime("%H:%M %Z")
+
+
+def cmd_status():
+    sunrise, sunset = todays_sun_times()
+    print(f"location:  {LAT}, {LON}")
+    print(f"sunrise:   {_fmt(sunrise)}")
+    print(f"sunset:    {_fmt(sunset)}")
+    print(f"now:       {datetime.now().astimezone().strftime('%H:%M %Z')}")
+    print(f"should be: grayscale {'on' if is_night() else 'off'}")
+    print(f"currently: grayscale {'on' if current_grayscale() else 'off'}")
+
+
+def cmd_times():
+    sunrise, sunset = todays_sun_times()
+    print(f"sunrise {_fmt(sunrise)}  sunset {_fmt(sunset)}")
+
+
+def main(argv):
+    cmd = argv[1] if len(argv) > 1 else "status"
+    if cmd == "apply":
+        cmd_apply(dry_run="--dry-run" in argv)
+    elif cmd == "on":
+        set_grayscale(True)
+        print("grayscale on")
+    elif cmd == "off":
+        set_grayscale(False)
+        print("grayscale off")
+    elif cmd == "status":
+        cmd_status()
+    elif cmd == "times":
+        cmd_times()
+    else:
+        print(__doc__)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

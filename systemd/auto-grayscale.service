@@ -1,0 +1,12 @@
+[Unit]
+Description=Apply auto-grayscale (grayscale from sunset to sunrise)
+After=graphical-session.target
+PartOf=graphical-session.target
+
+# NOTE: install.sh writes the real unit into ~/.config/systemd/user/ with the
+# ExecStart path filled in to wherever this repo lives. This file is a template
+# for reference.
+
+[Service]
+Type=oneshot
+ExecStart=%h/auto-grayscale/auto-grayscale apply
