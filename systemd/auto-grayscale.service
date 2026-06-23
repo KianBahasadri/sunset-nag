@@ -1,5 +1,5 @@
 [Unit]
-Description=Apply auto-grayscale (grayscale from sunset to sunrise)
+Description=auto-grayscale: fade screen to grayscale around sunset/sunrise
 After=graphical-session.target
 PartOf=graphical-session.target
 
@@ -8,5 +8,10 @@ PartOf=graphical-session.target
 # for reference.
 
 [Service]
-Type=oneshot
-ExecStart=%h/auto-grayscale/auto-grayscale apply
+Type=simple
+ExecStart=%h/auto-grayscale/auto-grayscale daemon
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

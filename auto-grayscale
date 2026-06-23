@@ -1,27 +1,30 @@
 #!/usr/bin/env python3
-"""auto-grayscale: make the GNOME (Wayland) screen grayscale between sunset and
-sunrise.
+"""auto-grayscale: fade the GNOME (Wayland) screen to grayscale around sunset and
+back to color around sunrise.
 
-Grayscale is achieved with GNOME's accessibility magnifier at 1x zoom with
-color-saturation set to 0 (full desaturation). No external packages are needed:
-sunrise/sunset are computed locally with the standard sunrise equation.
+Grayscale is achieved with GNOME's accessibility magnifier at 1x zoom, varying
+color-saturation between 1.0 (full color) and 0.0 (full grayscale). The
+saturation follows a linear ramp over a transition window centered on sunset and
+sunrise, so the change is gradual rather than instant. No external packages are
+needed: sunrise/sunset are computed locally with the standard sunrise equation.
 
 Subcommands:
-  apply    Compute the correct state for "now" and apply it (used by the timer).
-  on       Force grayscale on.
-  off      Force grayscale off (full color).
-  status   Print today's sun times and current state.
+  daemon   Run continuously, adjusting saturation over time (used by the service).
+  apply    Set the correct saturation for "now" once, then exit.
+  on       Force full grayscale now.
+  off      Force full color now.
+  status   Print today's sun times, transition windows, and current state.
   times    Print today's sunrise and sunset.
 
-Run `apply` on a timer (see auto-grayscale.timer) to keep the screen in the
-right state. It is idempotent: it only touches gsettings when a change is
-needed.
+The daemon steps every few seconds while inside a transition window (for a smooth
+fade) and sleeps until the next window otherwise. All changes are idempotent.
 """
 
 import math
 import subprocess
 import sys
-from datetime import datetime, timezone
+import time
+from datetime import datetime, timedelta, timezone
 
 # ---------------------------------------------------------------------------
 # Configuration -- edit these for your location.
@@ -33,7 +36,20 @@ LON = -79.3832
 # value (sun's upper limb at the horizon, accounting for refraction).
 # Use -6 for civil twilight if you want the switch a bit later/earlier.
 SUN_ALTITUDE = -0.833
+# Length of the fade, in minutes. The ramp is centered on the event, so with 15
+# the fade runs from 7.5 min before sunset to 7.5 min after (and likewise for
+# sunrise). To instead start the fade exactly at the event, see ANCHOR below.
+TRANSITION_MINUTES = 15
+# Where the transition sits relative to the event:
+#   "center" -> [event - T/2, event + T/2]   (50% gray exactly at sunset)
+#   "start"  -> [event, event + T]           (full color at sunset, gray after)
+#   "end"    -> [event - T, event]           (fully gray exactly at sunset)
+ANCHOR = "center"
 # ---------------------------------------------------------------------------
+
+# Daemon timing.
+STEP_SECONDS = 5            # update interval while fading
+MAX_IDLE_SECONDS = 60       # longest sleep when not fading
 
 MAGNIFIER = "org.gnome.desktop.a11y.magnifier"
 A11Y_APPS = "org.gnome.desktop.a11y.applications"
@@ -91,21 +107,83 @@ def sun_times(lat, lon, year, month, day):
     return jd_to_dt(j_transit - w / 360.0), jd_to_dt(j_transit + w / 360.0)
 
 
+def sun_times_for(local_date):
+    return sun_times(LAT, LON, local_date.year, local_date.month, local_date.day)
+
+
 def todays_sun_times():
     """(sunrise, sunset) UTC datetimes for the current *local* date."""
-    local_now = datetime.now().astimezone()
-    return sun_times(LAT, LON, local_now.year, local_now.month, local_now.day)
+    return sun_times_for(datetime.now().astimezone().date())
 
 
-def is_night(now=None):
-    """True if grayscale should be on right now (before sunrise or after sunset)."""
+def _window(event):
+    """(start, end) of the transition window around an event time."""
+    T = timedelta(minutes=TRANSITION_MINUTES)
+    if ANCHOR == "start":
+        return event, event + T
+    if ANCHOR == "end":
+        return event - T, event
+    return event - T / 2, event + T / 2     # "center"
+
+
+def _clamp(x, lo=0.0, hi=1.0):
+    return max(lo, min(hi, x))
+
+
+def is_night(now, sunrise, sunset):
+    """True outside the daytime band (before sunrise or after sunset)."""
+    return now < sunrise or now >= sunset
+
+
+def target_saturation(now=None):
+    """Desired color-saturation (1.0 full color, 0.0 grayscale) for `now`,
+    interpolated across the sunset/sunrise transition windows."""
     if now is None:
         now = datetime.now(timezone.utc)
     sunrise, sunset = todays_sun_times()
     if sunrise is None or sunset is None:
-        return False            # polar edge case: leave color as-is, do nothing
-    return now < sunrise or now >= sunset
+        return 1.0      # polar edge case: leave color alone
 
+    rise_start, rise_end = _window(sunrise)
+    set_start, set_end = _window(sunset)
+
+    if set_start <= now <= set_end:                 # fading to grayscale
+        frac = (now - set_start) / (set_end - set_start)
+        return _clamp(1.0 - frac)
+    if rise_start <= now <= rise_end:               # fading back to color
+        frac = (now - rise_start) / (rise_end - rise_start)
+        return _clamp(frac)
+    return 0.0 if is_night(now, sunrise, sunset) else 1.0
+
+
+def in_transition(now=None):
+    if now is None:
+        now = datetime.now(timezone.utc)
+    sunrise, sunset = todays_sun_times()
+    if sunrise is None or sunset is None:
+        return False
+    for event in (sunrise, sunset):
+        start, end = _window(event)
+        if start <= now <= end:
+            return True
+    return False
+
+
+def seconds_until_next_window(now=None):
+    """Seconds until the next transition window starts (today or tomorrow)."""
+    if now is None:
+        now = datetime.now(timezone.utc)
+    today = datetime.now().astimezone().date()
+    starts = []
+    for off in (0, 1):
+        sr, ss = sun_times_for(today + timedelta(days=off))
+        if sr and ss:
+            starts += [_window(sr)[0], _window(ss)[0]]
+    future = [s for s in starts if s > now]
+    return (min(future) - now).total_seconds() if future else MAX_IDLE_SECONDS
+
+
+# --- gsettings plumbing -----------------------------------------------------
 
 def _gset(schema, key, value):
     subprocess.run(["gsettings", "set", schema, key, value], check=True)
@@ -118,57 +196,91 @@ def _gget(schema, key):
     ).stdout.strip()
 
 
-def current_grayscale():
-    """True if the screen is currently grayscale (magnifier on + saturation 0)."""
+def magnifier_enabled():
     try:
-        enabled = _gget(A11Y_APPS, "screen-magnifier-enabled") == "true"
-        sat = float(_gget(MAGNIFIER, "color-saturation"))
-    except (subprocess.CalledProcessError, ValueError):
+        return _gget(A11Y_APPS, "screen-magnifier-enabled") == "true"
+    except subprocess.CalledProcessError:
         return False
-    return enabled and sat < 0.5
 
 
-def set_grayscale(enabled):
-    if enabled:
-        # 1x zoom, whole screen, no lens -> no visible magnification, just desaturate.
+def current_saturation():
+    try:
+        return float(_gget(MAGNIFIER, "color-saturation"))
+    except (subprocess.CalledProcessError, ValueError):
+        return 1.0
+
+
+def apply_saturation(sat):
+    """Idempotently make the screen show the given saturation. The magnifier is
+    only enabled while saturation < 1.0; it is enabled/disabled at saturation
+    ~1.0 so that turning it on/off is itself imperceptible."""
+    sat = _clamp(sat)
+    enabled = magnifier_enabled()
+
+    if sat >= 0.999:                                # full color -> magnifier off
+        if enabled:
+            _gset(MAGNIFIER, "color-saturation", "1.0")
+            _gset(A11Y_APPS, "screen-magnifier-enabled", "false")
+        return
+
+    target = round(sat, 3)
+    if not enabled:
+        # 1x zoom, whole screen, no lens -> no magnification, only desaturation.
         _gset(MAGNIFIER, "mag-factor", "1.0")
         _gset(MAGNIFIER, "lens-mode", "false")
         _gset(MAGNIFIER, "screen-position", "'full-screen'")
-        _gset(MAGNIFIER, "color-saturation", "0.0")
+        _gset(MAGNIFIER, "color-saturation", str(target))
         _gset(A11Y_APPS, "screen-magnifier-enabled", "true")
-    else:
-        _gset(A11Y_APPS, "screen-magnifier-enabled", "false")
-        _gset(MAGNIFIER, "color-saturation", "1.0")
+    elif round(current_saturation(), 3) != target:
+        _gset(MAGNIFIER, "color-saturation", str(target))
 
 
-def cmd_apply(dry_run=False):
-    want = is_night()
-    have = current_grayscale()
-    if want == have:
-        print(f"no change: grayscale {'on' if have else 'off'}")
-        return
-    print(f"{'would set' if dry_run else 'setting'} grayscale {'on' if want else 'off'}")
-    if not dry_run:
+# --- commands ---------------------------------------------------------------
+
+def cmd_daemon():
+    print("auto-grayscale daemon started "
+          f"(transition {TRANSITION_MINUTES} min, anchor {ANCHOR})", flush=True)
+    while True:
+        now = datetime.now(timezone.utc)
         try:
-            set_grayscale(want)
+            apply_saturation(target_saturation(now))
         except (subprocess.CalledProcessError, FileNotFoundError) as e:
-            # No reachable GNOME session bus (e.g. ran outside a session).
-            # Nothing to do -- exit quietly so the timer isn't marked failed.
-            print(f"skipped: gsettings not reachable ({e})")
+            print(f"skipped: gsettings not reachable ({e})", flush=True)
+        if in_transition(now):
+            sleep = STEP_SECONDS
+        else:
+            sleep = _clamp(seconds_until_next_window(now), STEP_SECONDS, MAX_IDLE_SECONDS)
+        time.sleep(sleep)
+
+
+def cmd_apply():
+    sat = target_saturation()
+    try:
+        apply_saturation(sat)
+        print(f"saturation set to {round(sat, 3)}")
+    except (subprocess.CalledProcessError, FileNotFoundError) as e:
+        print(f"skipped: gsettings not reachable ({e})")
 
 
 def _fmt(dt):
-    return "n/a" if dt is None else dt.astimezone().strftime("%H:%M %Z")
+    return "n/a" if dt is None else dt.astimezone().strftime("%-I:%M %p")
 
 
 def cmd_status():
     sunrise, sunset = todays_sun_times()
-    print(f"location:  {LAT}, {LON}")
-    print(f"sunrise:   {_fmt(sunrise)}")
-    print(f"sunset:    {_fmt(sunset)}")
-    print(f"now:       {datetime.now().astimezone().strftime('%H:%M %Z')}")
-    print(f"should be: grayscale {'on' if is_night() else 'off'}")
-    print(f"currently: grayscale {'on' if current_grayscale() else 'off'}")
+    print(f"location:    {LAT}, {LON}")
+    print(f"sunrise:     {_fmt(sunrise)}")
+    print(f"sunset:      {_fmt(sunset)}")
+    if sunrise and sunset:
+        rs, re_ = _window(sunrise)
+        ss, se = _window(sunset)
+        print(f"to-color:    {_fmt(rs)} -> {_fmt(re_)}  (fade {TRANSITION_MINUTES} min)")
+        print(f"to-gray:     {_fmt(ss)} -> {_fmt(se)}  (fade {TRANSITION_MINUTES} min)")
+    print(f"now:         {datetime.now().astimezone().strftime('%-I:%M %p')}")
+    print(f"in fade:     {'yes' if in_transition() else 'no'}")
+    print(f"target sat:  {round(target_saturation(), 3)}")
+    print(f"current sat: {round(current_saturation(), 3)} "
+          f"(magnifier {'on' if magnifier_enabled() else 'off'})")
 
 
 def cmd_times():
@@ -178,13 +290,15 @@ def cmd_times():
 
 def main(argv):
     cmd = argv[1] if len(argv) > 1 else "status"
-    if cmd == "apply":
-        cmd_apply(dry_run="--dry-run" in argv)
+    if cmd == "daemon":
+        cmd_daemon()
+    elif cmd == "apply":
+        cmd_apply()
     elif cmd == "on":
-        set_grayscale(True)
+        apply_saturation(0.0)
         print("grayscale on")
     elif cmd == "off":
-        set_grayscale(False)
+        apply_saturation(1.0)
         print("grayscale off")
     elif cmd == "status":
         cmd_status()
