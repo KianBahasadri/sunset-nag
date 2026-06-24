@@ -18,6 +18,10 @@ Subcommands:
 
 The daemon steps every few seconds while inside a transition window (for a smooth
 fade) and sleeps until the next window otherwise. All changes are idempotent.
+
+Configuration can also live in a .env file next to this script (see .env.example).
+The daemon re-reads it every loop, so set ENABLED=false there to keep full color
+while the systemd service keeps running.
 """
 
 import math
@@ -25,26 +29,38 @@ import subprocess
 import sys
 import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+ENV_PATH = SCRIPT_DIR / ".env"
 
 # ---------------------------------------------------------------------------
-# Configuration -- edit these for your location.
+# Configuration -- edit these for your location, or override via .env.
 # Latitude is north-positive, longitude is east-positive.
 # Toronto, ON:
-LAT = 43.6532
-LON = -79.3832
+_DEFAULT_LAT = 43.6532
+_DEFAULT_LON = -79.3832
 # Sun altitude (degrees) that counts as sunrise/sunset. -0.833 is the standard
 # value (sun's upper limb at the horizon, accounting for refraction).
 # Use -6 for civil twilight if you want the switch a bit later/earlier.
-SUN_ALTITUDE = -0.833
+_DEFAULT_SUN_ALTITUDE = -0.833
 # Length of the fade, in minutes. The ramp is centered on the event, so with 15
 # the fade runs from 7.5 min before sunset to 7.5 min after (and likewise for
 # sunrise). To instead start the fade exactly at the event, see ANCHOR below.
-TRANSITION_MINUTES = 15
+_DEFAULT_TRANSITION_MINUTES = 15
 # Where the transition sits relative to the event:
 #   "center" -> [event - T/2, event + T/2]   (50% gray exactly at sunset)
 #   "start"  -> [event, event + T]           (full color at sunset, gray after)
 #   "end"    -> [event - T, event]           (fully gray exactly at sunset)
-ANCHOR = "center"
+_DEFAULT_ANCHOR = "center"
+_DEFAULT_ENABLED = True
+
+LAT = _DEFAULT_LAT
+LON = _DEFAULT_LON
+SUN_ALTITUDE = _DEFAULT_SUN_ALTITUDE
+TRANSITION_MINUTES = _DEFAULT_TRANSITION_MINUTES
+ANCHOR = _DEFAULT_ANCHOR
+ENABLED = _DEFAULT_ENABLED
 # ---------------------------------------------------------------------------
 
 # Daemon timing.
@@ -53,6 +69,49 @@ MAX_IDLE_SECONDS = 60       # longest sleep when not fading
 
 MAGNIFIER = "org.gnome.desktop.a11y.magnifier"
 A11Y_APPS = "org.gnome.desktop.a11y.applications"
+
+
+def _parse_bool(value):
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
+def load_env():
+    """Reload configuration from .env, falling back to script defaults."""
+    global LAT, LON, SUN_ALTITUDE, TRANSITION_MINUTES, ANCHOR, ENABLED
+
+    values = {
+        "LAT": _DEFAULT_LAT,
+        "LON": _DEFAULT_LON,
+        "SUN_ALTITUDE": _DEFAULT_SUN_ALTITUDE,
+        "TRANSITION_MINUTES": _DEFAULT_TRANSITION_MINUTES,
+        "ANCHOR": _DEFAULT_ANCHOR,
+        "ENABLED": _DEFAULT_ENABLED,
+    }
+
+    if ENV_PATH.is_file():
+        for line in ENV_PATH.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" not in line:
+                continue
+            key, _, raw = line.partition("=")
+            key = key.strip().upper()
+            if key:
+                values[key] = raw.strip().strip("'\"")
+
+    LAT = float(values["LAT"])
+    LON = float(values["LON"])
+    SUN_ALTITUDE = float(values["SUN_ALTITUDE"])
+    TRANSITION_MINUTES = int(float(values["TRANSITION_MINUTES"]))
+    ANCHOR = str(values["ANCHOR"]).strip().lower()
+    if ANCHOR not in ("center", "start", "end"):
+        ANCHOR = _DEFAULT_ANCHOR
+
+    if "DISABLED" in values:
+        ENABLED = not _parse_bool(values["DISABLED"])
+    else:
+        ENABLED = _parse_bool(values["ENABLED"])
 
 
 def sun_times(lat, lon, year, month, day):
@@ -238,23 +297,32 @@ def apply_saturation(sat):
 # --- commands ---------------------------------------------------------------
 
 def cmd_daemon():
+    load_env()
     print("auto-grayscale daemon started "
-          f"(transition {TRANSITION_MINUTES} min, anchor {ANCHOR})", flush=True)
+          f"(transition {TRANSITION_MINUTES} min, anchor {ANCHOR}, "
+          f"enabled {'yes' if ENABLED else 'no'})", flush=True)
     while True:
+        load_env()
         now = datetime.now(timezone.utc)
         try:
-            apply_saturation(target_saturation(now))
+            if ENABLED:
+                apply_saturation(target_saturation(now))
+            else:
+                apply_saturation(1.0)
         except (subprocess.CalledProcessError, FileNotFoundError) as e:
             print(f"skipped: gsettings not reachable ({e})", flush=True)
-        if in_transition(now):
+        if ENABLED and in_transition(now):
             sleep = STEP_SECONDS
         else:
-            sleep = _clamp(seconds_until_next_window(now), STEP_SECONDS, MAX_IDLE_SECONDS)
+            sleep = STEP_SECONDS if not ENABLED else _clamp(
+                seconds_until_next_window(now), STEP_SECONDS, MAX_IDLE_SECONDS
+            )
         time.sleep(sleep)
 
 
 def cmd_apply():
-    sat = target_saturation()
+    load_env()
+    sat = 1.0 if not ENABLED else target_saturation()
     try:
         apply_saturation(sat)
         print(f"saturation set to {round(sat, 3)}")
@@ -267,7 +335,10 @@ def _fmt(dt):
 
 
 def cmd_status():
+    load_env()
     sunrise, sunset = todays_sun_times()
+    env_note = f" ({ENV_PATH})" if ENV_PATH.is_file() else ""
+    print(f"enabled:     {'yes' if ENABLED else 'no'}{env_note}")
     print(f"location:    {LAT}, {LON}")
     print(f"sunrise:     {_fmt(sunrise)}")
     print(f"sunset:      {_fmt(sunset)}")
@@ -277,13 +348,15 @@ def cmd_status():
         print(f"to-color:    {_fmt(rs)} -> {_fmt(re_)}  (fade {TRANSITION_MINUTES} min)")
         print(f"to-gray:     {_fmt(ss)} -> {_fmt(se)}  (fade {TRANSITION_MINUTES} min)")
     print(f"now:         {datetime.now().astimezone().strftime('%-I:%M %p')}")
-    print(f"in fade:     {'yes' if in_transition() else 'no'}")
-    print(f"target sat:  {round(target_saturation(), 3)}")
+    print(f"in fade:     {'yes' if ENABLED and in_transition() else 'no'}")
+    target = 1.0 if not ENABLED else target_saturation()
+    print(f"target sat:  {round(target, 3)}")
     print(f"current sat: {round(current_saturation(), 3)} "
           f"(magnifier {'on' if magnifier_enabled() else 'off'})")
 
 
 def cmd_times():
+    load_env()
     sunrise, sunset = todays_sun_times()
     print(f"sunrise {_fmt(sunrise)}  sunset {_fmt(sunset)}")
 
@@ -309,6 +382,8 @@ def main(argv):
         return 2
     return 0
 
+
+load_env()
 
 if __name__ == "__main__":
     sys.exit(main(sys.argv))

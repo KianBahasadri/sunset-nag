@@ -9,6 +9,10 @@ UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 chmod +x "$SCRIPT"
 mkdir -p "$UNIT_DIR"
 
+if [[ ! -f "$DIR/.env" && -f "$DIR/.env.example" ]]; then
+    cp "$DIR/.env.example" "$DIR/.env"
+fi
+
 # Migrate away from the old per-minute timer if it is installed.
 if systemctl --user list-unit-files auto-grayscale.timer >/dev/null 2>&1; then
     systemctl --user disable --now auto-grayscale.timer 2>/dev/null || true
