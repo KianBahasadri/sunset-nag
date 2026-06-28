@@ -3,10 +3,10 @@
 
 At sunset, enables GNOME Night Light at a mild warm temperature, then ramps the
 screen progressively hotter while nagging with a desktop notification every
-N minutes (controlled by NAG_INTERVAL). Clicking "Snooze" on the notification
-freezes the temperature; dismissing it (or letting it auto-timeout) advances the
-ramp and makes the screen visibly more orange. Sunrise disables Night Light and
-restores whatever you had before.
+N minutes (controlled by NAG_INTERVAL). Clicking "Snooze" ramps the temperature
+warmer and pauses for SNOOZE_MINUTES before the next nag. Clicking "It's an
+emergency" disables Night Light for the rest of the night so you can keep
+working. Sunrise disables Night Light and restores whatever you had before.
 
 Subcommands:
   daemon    Run continuously as a background service.
@@ -310,13 +310,12 @@ def ensure_gsd_color():
 # Notification.
 # ---------------------------------------------------------------------------
 
-def send_nag_notification(temp_k, wait=True):
-    """Show a desktop notification with a Snooze action.
+def send_nag_notification(temp_k):
+    """Show a resident desktop notification with Snooze + Emergency actions.
 
-    Returns True if the user clicked Snooze, False if they dismissed (or it
-    timed out when wait=False). With wait=True, the notification is made
-    resident (-w) so GNOME keeps it visible; notify-send blocks until the user
-    clicks either action.
+    Returns the action name the user clicked: "snooze", "emergency", or ""
+    if the subprocess errored/timed out. The notification is resident (-w)
+    so GNOME keeps it visible until one of the buttons is clicked.
     """
     cmd = [
         "notify-send",
@@ -324,17 +323,16 @@ def send_nag_notification(temp_k, wait=True):
         "-w",
         "-u", "normal",
         "-A", "snooze=Snooze " + str(SNOOZE_MINUTES) + " min",
+        "-A", "emergency=It\u2019s an emergency",
         "Time to wind down \u2600\ufe0f",
-        "Screen is " + str(temp_k) + "K. Dismiss to ramp warmer.",
+        "Screen is " + str(temp_k) + "K.",
     ]
-    if not wait:
-        cmd.remove("-w")
 
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        return result.stdout.strip() == "snooze"
+        return result.stdout.strip()
     except (FileNotFoundError, subprocess.TimeoutExpired):
-        return False
+        return ""
 
 
 # ---------------------------------------------------------------------------
@@ -380,6 +378,7 @@ def cmd_daemon():
         last_nag_time = None
         snoozed_until = None
         current_temp_k = START_TEMPERATURE
+        nag_disabled = False      # emergency: suppress nags until sunrise
 
         while not stop["flag"]:
             load_env()
@@ -422,11 +421,12 @@ def cmd_daemon():
                 nag_end_sunrise = None
                 last_nag_time = None
                 snoozed_until = None
+                nag_disabled = False
                 print(f"sunrise -- nag ended ({_fmt(sunrise)})", flush=True)
 
             # Active nag period.
             if ENABLED and nag_start_sunset is not None and \
-               now_utc < nag_end_sunrise:
+               now_utc < nag_end_sunrise and not nag_disabled:
                 ensure_gsd_color()
 
                 if snoozed_until and datetime.now() < snoozed_until:
@@ -436,18 +436,36 @@ def cmd_daemon():
                 if last_nag_time is None or \
                    (datetime.now() - last_nag_time).total_seconds() \
                         >= NAG_INTERVAL * 60:
-                    was_snoozed = send_nag_notification(current_temp_k)
+                    action = send_nag_notification(current_temp_k)
                     last_nag_time = datetime.now()
 
-                    if was_snoozed:
+                    if action == "snooze":
                         snoozed_until = datetime.now() + \
                             timedelta(minutes=SNOOZE_MINUTES)
-                    else:
                         current_temp_k = max(
                             END_TEMPERATURE, current_temp_k - TEMP_STEP
                         )
                         set_temperature(current_temp_k)
+                    elif action == "emergency":
+                        _restore_state(delete=False)
+                        try:
+                            _set_key("night-light-enabled", "false")
+                        except subprocess.CalledProcessError:
+                            pass
+                        # Keep the nag window marked active (do NOT null
+                        # nag_start_sunset): nulling it makes the `entered`
+                        # transition re-fire while it is still night and call
+                        # configure_night_light_schedule(), which re-enables
+                        # Night Light seconds later. Suppress nags until
+                        # sunrise with nag_disabled instead.
+                        nag_disabled = True
+                        last_nag_time = None
                         snoozed_until = None
+                        print("emergency -- Night Light disabled until sunrise",
+                              flush=True)
+                        time.sleep(DAEMON_SLEEP)
+                        continue
+                    # timeout/error: ignore, will re-nag next cycle
 
                 time.sleep(DAEMON_SLEEP)
                 continue
@@ -491,7 +509,7 @@ def cmd_status():
 
     print(f"start temp:     {START_TEMPERATURE}K")
     print(f"end temp:       {END_TEMPERATURE}K")
-    print(f"step:           -{TEMP_STEP}K per dismissed nag")
+    print(f"step:           -{TEMP_STEP}K per Snooze")
     print(f"nag interval:   {NAG_INTERVAL} min")
     print(f"snooze pause:   {SNOOZE_MINUTES} min")
 
@@ -510,16 +528,19 @@ def cmd_test():
     configure_night_light_schedule()
     set_temperature(START_TEMPERATURE)
     ensure_gsd_color()
-    print("notification sent -- click Snooze or dismiss")
+    print("notification sent -- click Snooze or It's an emergency")
 
-    was_snoozed = send_nag_notification(START_TEMPERATURE)
-    if was_snoozed:
-        print(f"snoozed -- temperature stays at {START_TEMPERATURE}K")
+    action = send_nag_notification(START_TEMPERATURE)
+    if action == "snooze":
+        new_temp = max(END_TEMPERATURE, START_TEMPERATURE - TEMP_STEP)
+        set_temperature(new_temp)
+        print(f"snoozed -- ramping to {new_temp}K, pausing {SNOOZE_MINUTES} min")
+        time.sleep(3)
+    elif action == "emergency":
+        print("emergency -- would disable Night Light for the night")
         time.sleep(3)
     else:
-        new_temp = max(END_TEMPERATURE, START_TEMPERATURE - TEMP_STEP)
-        print(f"dismissed -- ramping to {new_temp}K")
-        set_temperature(new_temp)
+        print("no action (timeout/error)")
         time.sleep(3)
 
     print("restoring...")

@@ -4,11 +4,11 @@ A gentle but escalating nudge to get off the computer at sunset, built for
 **GNOME on Wayland**.
 
 At sunset, the screen warms up (via GNOME Night Light) starting at a mild
-4000 K. Every 5 minutes, a desktop notification with a **Snooze** button
-appears. If you snooze, the temperature holds steady. If you dismiss (or
-ignore) the notification, the screen ramps progressively more orange toward
-1800 K — unpleasant enough to break focus without being forced. Sunrise (or
-the daemon stopping) restores your original Night Light settings.
+4000 K. Every 5 minutes, a desktop notification appears with two options:
+**Snooze** ramps the temperature progressively warmer (toward 1800 K) and
+pauses for a few minutes, or **It's an emergency** disables Night Light for
+the rest of the night so you can keep working. Sunrise (or the daemon
+stopping) restores your original Night Light settings.
 
 No external packages: sunrise/sunset are computed locally in Python, and Night
 Light is controlled via `gsettings`.
@@ -21,11 +21,11 @@ Light is controlled via `gsettings`.
   24 h (so GNOME applies the colour shift regardless of its own sunset calc),
   and starts the nag loop.
 - The loop checks every few seconds. When `NAG_INTERVAL` minutes have passed, it
-  sends a notification via `notify-send` with an `--action=snooze` button.
-  - **Snooze:** the temperature freezes for `SNOOZE_MINUTES` minutes, then the
-    cycle resumes.
-  - **Dismiss / timeout:** the temperature drops by `TEMP_STEP` K (minimum
-    `END_TEMPERATURE`), and the next cycle starts immediately.
+  sends a notification via `notify-send` with two action buttons:
+  - **Snooze:** the temperature ramps `TEMP_STEP` K warmer (down to `END_TEMPERATURE`),
+    then pauses for `SNOOZE_MINUTES` before the next nag.
+  - **It's an emergency:** Night Light is disabled for the rest of the night and
+    the daemon goes back to idle until the next sunset. Use sparingly.
 - The daemon idles through the day and only activates between sunset and sunrise.
   After sunrise (or on SIGTERM/SIGINT), it restores the saved Night Light
   settings.
@@ -42,9 +42,9 @@ LON=-79.3832                 # east-positive (negative = west)
 SUN_ALTITUDE=-0.833          # standard; use -6 for civil twilight
 START_TEMPERATURE=4000       # K applied at sunset (mild amber)
 END_TEMPERATURE=1800         # K floor (deep lava-orange)
-TEMP_STEP=200                # K ramp per dismissed notification
+TEMP_STEP=200                # K ramp per Snooze
 NAG_INTERVAL=5               # minutes between notifications
-SNOOZE_MINUTES=5             # freeze duration after clicking Snooze
+SNOOZE_MINUTES=5             # pause duration after clicking Snooze
 ```
 
 ## Install

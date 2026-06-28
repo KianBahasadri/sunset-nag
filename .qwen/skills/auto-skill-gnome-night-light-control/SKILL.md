@@ -270,3 +270,105 @@ Before shipping, trace through these scenarios by hand (or in a test):
 - [ ] **Manual `on`/`test`:** are original settings saved *before* mutation? Does restore bring back the *exact* prior value, not a hardcoded default?
 - [ ] **Crash mid-nag:** is the state file restored on next start, not left stale?
 - [ ] **Idle CPU:** is the idle sleep bounded by time-to-next-event, not a tight fixed tick?
+- [ ] **Mid-evening ENABLED toggle:** does the `entered` branch prime `current_temp_k` outside the `if ENABLED:` guard?
+
+### 5. Mid-evening `ENABLED` toggle must not corrupt the ramp start temp
+
+The `entered` branch sets `current_temp_k = START_TEMPERATURE` inside the `if ENABLED:` guard. If the daemon was running with `ENABLED=false` through the sunset transition and the user flips it to `true` mid-evening, the daemon never re-fires `entered` (it's already in the window), so `current_temp_k` starts the ramp from whatever stale value it held.
+
+**Fix:** always prime the ramp start temperature on entry, regardless of `ENABLED`:
+
+```python
+if entered:
+    nag_start_sunset = sunset
+    nag_end_sunrise = sunrise
+    # Always prime, regardless of ENABLED:
+    current_temp_k = START_TEMPERATURE
+    if ENABLED:
+        configure_night_light_schedule()
+        set_temperature(current_temp_k)
+```
+
+Then when `ENABLED` flips on, the active-nag block picks up the already-primed correct starting temperature on the next loop.
+
+## Multi-Action Notifications and the Emergency Pattern
+
+### Two-button design: Snooze + Emergency
+
+A nag daemon that only offers one escape hatch forces the user into an all-or-nothing choice. Splitting into two actions is cleaner:
+
+- **Snooze** — ramp the temperature warmer, pause for `SNOOZE_MINUTES`
+- **It's an emergency** — disable Night Light for the rest of the night (use sparingly)
+
+Pass multiple `-A` flags to `notify-send` for each action:
+
+```bash
+notify-send -a "sunset-nag" -w -u normal \
+  -A "snooze=Snooze 5 min" \
+  -A "emergency=It's an emergency" \
+  "Time to wind down ☀️" \
+  "Screen is 3800K."
+```
+
+Return the action string (not a boolean) and handle each case:
+
+```python
+def send_nag_notification(temp_k):
+    cmd = ["notify-send", "-a", "sunset-nag", "-w", "-u", "normal",
+           "-A", "snooze=Snooze 5 min",
+           "-A", "emergency=It's an emergency",
+           "Time to wind down ☀️", f"Screen is {temp_k}K."]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        return result.stdout.strip()   # "snooze", "emergency", or ""
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return ""
+
+# In daemon loop:
+action = send_nag_notification(current_temp_k)
+if action == "snooze":
+    snoozed_until = datetime.now() + timedelta(minutes=SNOOZE_MINUTES)
+    current_temp_k = max(END_TEMPERATURE, current_temp_k - TEMP_STEP)
+    set_temperature(current_temp_k)
+elif action == "emergency":
+    _restore_state()
+    _set_key("night-light-enabled", "false")
+    # daemon goes idle until next sunset — no more nags tonight
+```
+
+### Emergency semantics
+
+The emergency action must **restore saved state**, **disable Night Light**, and **suppress nags for the rest of the night** — without re-enabling Night Light. The trap is in *how* you suppress.
+
+Nulling `nag_start_sunset` to "exit the active period" is **wrong**. The `entered` transition is `nag_start_sunset is None and now_utc >= sunset`; after an emergency it is still night, so the very next loop iteration re-fires `entered`, which calls `configure_night_light_schedule()` and flips `night-light-enabled` back to `true` — defeating the emergency seconds later.
+
+**Correct fix:** keep the nag window marked active (leave `nag_start_sunset` / `nag_end_sunrise` set) so `entered` cannot re-fire, and gate the active-nag branch with a `nag_disabled` flag that is cleared at sunrise:
+
+```python
+elif action == "emergency":
+    _restore_state(delete=False)      # keep the backup for the rest of the run
+    try:
+        _set_key("night-light-enabled", "false")
+    except subprocess.CalledProcessError:
+        pass
+    nag_disabled = True               # suppress nags until sunrise
+    last_nag_time = None
+    snoozed_until = None
+    print("emergency -- Night Light disabled until sunrise", flush=True)
+    time.sleep(DAEMON_SLEEP)
+    continue
+```
+
+The active-nag branch must include `and not nag_disabled`:
+
+```python
+if ENABLED and nag_start_sunset is not None and \
+   now_utc < nag_end_sunrise and not nag_disabled:
+    ...
+```
+
+and the `left` (sunrise) transition clears `nag_disabled = False` alongside the other trackers, so the next sunset starts fresh.
+
+**Why `delete=False`:** the daemon keeps running after an emergency and will mutate gsettings again (next sunset). Restoring without deleting keeps the original-settings backup on disk so a crash before sunrise can still restore; deleting it here leaves the rest of the run unbacked-up.
+
+**Common bug (the other extreme):** restoring state + disabling Night Light but leaving every tracker non-`None` and adding no suppression flag. The active-nag branch is still gated on `nag_start_sunset is not None`, so the daemon keeps re-nagging every `NAG_INTERVAL` despite the emergency. The `nag_disabled` flag is the minimal addition that suppresses nags *without* triggering `entered` re-entry — do not try to avoid it by nulling `nag_start_sunset`.
