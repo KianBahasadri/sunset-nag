@@ -1,0 +1,570 @@
+#!/usr/bin/env python3
+"""sunset-nag: nag yourself off the computer at sunset.
+
+At sunset, enables GNOME Night Light at a mild warm temperature, then ramps the
+screen progressively hotter while nagging with a desktop notification every
+N minutes (controlled by NAG_INTERVAL). Clicking "Snooze" on the notification
+freezes the temperature; dismissing it (or letting it auto-timeout) advances the
+ramp and makes the screen visibly more orange. Sunrise disables Night Light and
+restores whatever you had before.
+
+Subcommands:
+  daemon    Run continuously as a background service.
+  status    Print current state, schedule, and configuration.
+  times     Print today's sunrise and sunset.
+  test      Ramp temperature + fire a notification immediately (for testing).
+  off       Disable Night Light and restore original settings.
+  on        Force 1800K Night Light now (for previewing the extreme end).
+
+Configuration lives in a .env file next to this script (see .env.example). The
+daemon reloads it each loop, so changes take effect live.
+"""
+
+import json
+import math
+import signal
+import subprocess
+import sys
+import time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+ENV_PATH = SCRIPT_DIR / ".env"
+STATE_PATH = SCRIPT_DIR / ".state.json"
+
+# ---------------------------------------------------------------------------
+# Defaults -- override in .env.
+# ---------------------------------------------------------------------------
+_DEFAULT_LAT = 43.6532
+_DEFAULT_LON = -79.3832
+_DEFAULT_SUN_ALTITUDE = -0.833
+
+# Temperature ramp (Kelvin). Lower = warmer / more orange.
+_DEFAULT_START_TEMPERATURE = 4000
+_DEFAULT_END_TEMPERATURE = 1800
+_DEFAULT_TEMP_STEP = 200
+
+# Nag cadence.
+_DEFAULT_NAG_INTERVAL = 5          # minutes between notifications
+_DEFAULT_SNOOZE_MINUTES = 5        # how long Snooze pauses the ramp
+
+_DEFAULT_ENABLED = True
+
+# Daemon loop pacing.
+DAEMON_SLEEP = 5                   # seconds
+
+# Internal references.
+COLOR_SCHEMA = "org.gnome.settings-daemon.plugins.color"
+GSD_COLOR_BIN = "/usr/lib/gsd-color"
+DEFAULT_TEMPERATURE = 6500         # neutral daylight -- GNOME default
+
+# Module-level config (populated by load_env).
+LAT = _DEFAULT_LAT
+LON = _DEFAULT_LON
+SUN_ALTITUDE = _DEFAULT_SUN_ALTITUDE
+START_TEMPERATURE = _DEFAULT_START_TEMPERATURE
+END_TEMPERATURE = _DEFAULT_END_TEMPERATURE
+TEMP_STEP = _DEFAULT_TEMP_STEP
+NAG_INTERVAL = _DEFAULT_NAG_INTERVAL
+SNOOZE_MINUTES = _DEFAULT_SNOOZE_MINUTES
+ENABLED = _DEFAULT_ENABLED
+
+
+# ---------------------------------------------------------------------------
+# Config.
+# ---------------------------------------------------------------------------
+
+def _parse_bool(value):
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
+def load_env():
+    global LAT, LON, SUN_ALTITUDE, START_TEMPERATURE, END_TEMPERATURE, \
+           TEMP_STEP, NAG_INTERVAL, SNOOZE_MINUTES, ENABLED
+
+    values = {
+        "LAT": _DEFAULT_LAT,
+        "LON": _DEFAULT_LON,
+        "SUN_ALTITUDE": _DEFAULT_SUN_ALTITUDE,
+        "START_TEMPERATURE": _DEFAULT_START_TEMPERATURE,
+        "END_TEMPERATURE": _DEFAULT_END_TEMPERATURE,
+        "TEMP_STEP": _DEFAULT_TEMP_STEP,
+        "NAG_INTERVAL": _DEFAULT_NAG_INTERVAL,
+        "SNOOZE_MINUTES": _DEFAULT_SNOOZE_MINUTES,
+        "ENABLED": _DEFAULT_ENABLED,
+    }
+
+    if ENV_PATH.is_file():
+        for line in ENV_PATH.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" not in line:
+                continue
+            key, _, raw = line.partition("=")
+            key = key.strip().upper()
+            if key:
+                values[key] = raw.strip().strip("'\"")
+
+    LAT = float(values["LAT"])
+    LON = float(values["LON"])
+    SUN_ALTITUDE = float(values["SUN_ALTITUDE"])
+    START_TEMPERATURE = int(float(values["START_TEMPERATURE"]))
+    END_TEMPERATURE = int(float(values["END_TEMPERATURE"]))
+    TEMP_STEP = int(float(values["TEMP_STEP"]))
+    NAG_INTERVAL = int(float(values["NAG_INTERVAL"]))
+    SNOOZE_MINUTES = int(float(values["SNOOZE_MINUTES"]))
+
+    if "DISABLED" in values:
+        ENABLED = not _parse_bool(values["DISABLED"])
+    else:
+        ENABLED = _parse_bool(values["ENABLED"])
+
+
+# ---------------------------------------------------------------------------
+# Sun calculation -- sunrise equation.
+# ---------------------------------------------------------------------------
+
+def sun_times(lat, lon, year, month, day):
+    """Return (sunrise, sunset) as UTC datetimes, or (None, None) for polar cases."""
+    a = (14 - month) // 12
+    y = year + 4800 - a
+    m = month + 12 * a - 3
+    jdn = (
+        day + (153 * m + 2) // 5 + 365 * y + y // 4
+        - y // 100 + y // 400 - 32045
+    )
+    n = jdn - 2451545 + 0.0008
+    j_star = n - lon / 360.0
+    M = (357.5291 + 0.98560028 * j_star) % 360
+    Mr = math.radians(M)
+    C = (1.9148 * math.sin(Mr) + 0.0200 * math.sin(2 * Mr)
+         + 0.0003 * math.sin(3 * Mr))
+    lam = (M + C + 180 + 102.9372) % 360
+    lamr = math.radians(lam)
+    sin_d = math.sin(lamr) * math.sin(math.radians(23.4397))
+    cos_d = math.cos(math.asin(sin_d))
+    latr = math.radians(lat)
+    cos_w = (math.sin(math.radians(SUN_ALTITUDE))
+             - math.sin(latr) * sin_d) / (math.cos(latr) * cos_d)
+    if cos_w > 1 or cos_w < -1:
+        return None, None
+    w = math.degrees(math.acos(cos_w))
+    j_transit = (2451545.0 + j_star + 0.0053 * math.sin(Mr)
+                 - 0.0069 * math.sin(2 * lamr))
+
+    def jd_to_dt(jd):
+        return datetime.fromtimestamp((jd - 2440587.5) * 86400.0, tz=timezone.utc)
+
+    return jd_to_dt(j_transit - w / 360.0), jd_to_dt(j_transit + w / 360.0)
+
+
+def sun_times_for(local_date):
+    return sun_times(LAT, LON, local_date.year, local_date.month, local_date.day)
+
+
+def todays_sun_times():
+    return sun_times_for(datetime.now().astimezone().date())
+
+
+def _compute_night_window(now_utc, now_local_date):
+    """Return (sunset, sunrise) defining the current nag-active period.
+
+    If now is before today's sunrise, we're in the overnight tail of yesterday's
+    night: return yesterday's sunset + today's sunrise.
+    Otherwise return today's sunset + tomorrow's sunrise.
+    Returns (None, None) if the window cannot be determined.
+    """
+    today_sr, today_ss = sun_times_for(now_local_date)
+    tomorrow_sr, _ = sun_times_for(now_local_date + timedelta(days=1))
+
+    if today_sr is None or today_ss is None or tomorrow_sr is None:
+        return None, None
+
+    if now_utc < today_sr:
+        # Overnight: yesterday's sunset -> today's sunrise.
+        _, yesterday_ss = sun_times_for(now_local_date - timedelta(days=1))
+        if yesterday_ss is None:
+            return None, None
+        return yesterday_ss, today_sr
+    else:
+        return today_ss, tomorrow_sr
+
+
+# ---------------------------------------------------------------------------
+# State file -- preserves original Night Light settings for restore on exit.
+# ---------------------------------------------------------------------------
+
+def _save_state():
+    # Only capture original state once. If a state file already exists, the
+    # current gsettings values may already have been modified by us (e.g., after
+    # a daemon crash/restart), and overwriting would lose the true original.
+    if STATE_PATH.is_file():
+        return
+    try:
+        STATE_PATH.write_text(json.dumps({
+            "night-light-enabled": bool(_get_key_bool("night-light-enabled")),
+            "night-light-temperature": _get_key_int("night-light-temperature")
+                                       or DEFAULT_TEMPERATURE,
+            "night-light-schedule-automatic":
+                bool(_get_key_bool("night-light-schedule-automatic")),
+            "night-light-schedule-from": _gsettings("night-light-schedule-from"),
+            "night-light-schedule-to": _gsettings("night-light-schedule-to"),
+        }))
+    except subprocess.CalledProcessError:
+        pass
+
+
+def _restore_state(delete=True):
+    if not STATE_PATH.is_file():
+        return
+    try:
+        state = json.loads(STATE_PATH.read_text())
+        _set_key("night-light-temperature",
+                 state.get("night-light-temperature", DEFAULT_TEMPERATURE))
+        _set_key("night-light-enabled",
+                 "true" if state.get("night-light-enabled") else "false")
+        _set_key("night-light-schedule-automatic",
+                 "true" if state.get("night-light-schedule-automatic")
+                 else "false")
+        _set_key("night-light-schedule-from",
+                 state.get("night-light-schedule-from", "0.0"))
+        _set_key("night-light-schedule-to",
+                 state.get("night-light-schedule-to", "23.99"))
+    except (json.JSONDecodeError, subprocess.CalledProcessError):
+        pass
+    finally:
+        if delete:
+            STATE_PATH.unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# GNOME Night Light primitives.
+# ---------------------------------------------------------------------------
+
+def _gsettings(key):
+    return subprocess.run(
+        ["gsettings", "get", COLOR_SCHEMA, key],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+
+
+def _get_key_bool(key):
+    return _gsettings(key) == "true"
+
+
+def _get_key_int(key):
+    val = _gsettings(key)
+    if val.startswith("uint32"):
+        return int(val.split()[1])
+    return int(val) if val.isdigit() else None
+
+
+def _set_key(key, value):
+    subprocess.run(["gsettings", "set", COLOR_SCHEMA, key, str(value)],
+                   check=True)
+
+
+def configure_night_light_schedule():
+    """One-time setup: widen the manual schedule to 24h so night light applies
+    whenever enabled, regardless of real sunset/sunrise (which gsd-color
+    enforces internally via its own calculation)."""
+    _set_key("night-light-schedule-automatic", "false")
+    _set_key("night-light-schedule-from", "0.0")
+    _set_key("night-light-schedule-to", "23.99")
+    _set_key("night-light-enabled", "true")
+
+
+def set_temperature(temp_k):
+    _set_key("night-light-temperature", temp_k)
+
+
+def get_temperature():
+    return _get_key_int("night-light-temperature") or DEFAULT_TEMPERATURE
+
+
+def night_light_enabled():
+    try:
+        return _get_key_bool("night-light-enabled")
+    except subprocess.CalledProcessError:
+        return False
+
+
+def ensure_gsd_color():
+    """Restart gsd-color if it is not running."""
+    try:
+        subprocess.run(["pidof", GSD_COLOR_BIN],
+                       capture_output=True, check=True)
+        return
+    except subprocess.CalledProcessError:
+        pass
+    subprocess.Popen(
+        [GSD_COLOR_BIN],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Notification.
+# ---------------------------------------------------------------------------
+
+def send_nag_notification(temp_k, wait=True):
+    """Show a desktop notification with a Snooze action.
+
+    Returns True if the user clicked Snooze, False if they dismissed (or it
+    timed out when wait=False). With wait=True, the notification is made
+    resident (-w) so GNOME keeps it visible; notify-send blocks until the user
+    clicks either action.
+    """
+    cmd = [
+        "notify-send",
+        "-a", "sunset-nag",
+        "-w",
+        "-u", "normal",
+        "-A", "snooze=Snooze " + str(SNOOZE_MINUTES) + " min",
+        "Time to wind down \u2600\ufe0f",
+        "Screen is " + str(temp_k) + "K. Dismiss to ramp warmer.",
+    ]
+    if not wait:
+        cmd.remove("-w")
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        return result.stdout.strip() == "snooze"
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Formatting helpers.
+# ---------------------------------------------------------------------------
+
+def _fmt(dt):
+    return "n/a" if dt is None else dt.astimezone().strftime("%-I:%M %p")
+
+
+# ---------------------------------------------------------------------------
+# Commands.
+# ---------------------------------------------------------------------------
+
+def cmd_daemon():
+    load_env()
+    print(f"sunset-nag daemon started "
+          f"(ramp {START_TEMPERATURE}\u2192{END_TEMPERATURE}K, "
+          f"step -{TEMP_STEP}, "
+          f"nag every {NAG_INTERVAL} min, snooze {SNOOZE_MINUTES} min, "
+          f"enabled {'yes' if ENABLED else 'no'})", flush=True)
+
+    # If a previous run left a saved state (e.g., after a crash), restore it
+    # first so we don't treat a ramped screen as the user's original settings.
+    if STATE_PATH.is_file():
+        _restore_state()
+    # Persist current Night Light settings so we can restore on exit.
+    _save_state()
+
+    stop = {"flag": False}
+    def _handle_exit(*_):
+        stop["flag"] = True
+    signal.signal(signal.SIGTERM, _handle_exit)
+    signal.signal(signal.SIGINT, _handle_exit)
+
+    try:
+        # Track whether we have an active nag window. Initialized by the first
+        # loop iteration; preserved across sleep-wake so the logic detects both
+        # the sunset->active and active->sunrise transitions.
+        nag_start_sunset = None   # the sunset event that started the current nag
+        nag_end_sunrise = None    # the sunrise that will end it
+
+        last_nag_time = None
+        snoozed_until = None
+        current_temp_k = START_TEMPERATURE
+
+        while not stop["flag"]:
+            load_env()
+            now_utc = datetime.now(timezone.utc)
+            now_local = datetime.now().astimezone()
+
+            try:
+                sunset, sunrise = _compute_night_window(
+                    now_utc, now_local.date()
+                )
+            except Exception:
+                sunset, sunrise = None, None
+
+            if sunset is None or sunrise is None:
+                # Polar case or transient failure -- sleep and retry.
+                time.sleep(60)
+                continue
+
+            # Determine transitions:
+            entered = nag_start_sunset is None and now_utc >= sunset
+            left = nag_start_sunset is not None and now_utc >= nag_end_sunrise
+
+            if entered:
+                nag_start_sunset = sunset
+                nag_end_sunrise = sunrise
+                # Always prime the ramp start regardless of ENABLED, so a
+                # later mid-evening ENABLED toggle still begins from
+                # START_TEMPERATURE.
+                current_temp_k = START_TEMPERATURE
+                if ENABLED:
+                    configure_night_light_schedule()
+                    set_temperature(current_temp_k)
+                    print(f"sunset nag started (sunset was {_fmt(sunset)})",
+                          flush=True)
+
+            elif left:
+                _restore_state()
+                ensure_gsd_color()
+                nag_start_sunset = None
+                nag_end_sunrise = None
+                last_nag_time = None
+                snoozed_until = None
+                print(f"sunrise -- nag ended ({_fmt(sunrise)})", flush=True)
+
+            # Active nag period.
+            if ENABLED and nag_start_sunset is not None and \
+               now_utc < nag_end_sunrise:
+                ensure_gsd_color()
+
+                if snoozed_until and datetime.now() < snoozed_until:
+                    time.sleep(DAEMON_SLEEP)
+                    continue
+
+                if last_nag_time is None or \
+                   (datetime.now() - last_nag_time).total_seconds() \
+                        >= NAG_INTERVAL * 60:
+                    was_snoozed = send_nag_notification(current_temp_k)
+                    last_nag_time = datetime.now()
+
+                    if was_snoozed:
+                        snoozed_until = datetime.now() + \
+                            timedelta(minutes=SNOOZE_MINUTES)
+                    else:
+                        current_temp_k = max(
+                            END_TEMPERATURE, current_temp_k - TEMP_STEP
+                        )
+                        set_temperature(current_temp_k)
+                        snoozed_until = None
+
+                time.sleep(DAEMON_SLEEP)
+                continue
+
+            # Idle: sleep until near the next sunset, but cap at 60s so we
+            # notice config changes and clock shifts in reasonable time.
+            idle_sleep = min(60, max(5, int((sunset - now_utc).total_seconds())))
+            time.sleep(idle_sleep)
+
+    finally:
+        _restore_state()
+        print("sunset-nag daemon stopped; Night Light restored.", flush=True)
+
+
+def cmd_status():
+    load_env()
+    sunrise, sunset = todays_sun_times()
+    env_note = f" ({ENV_PATH})" if ENV_PATH.is_file() else ""
+    state_note = ""
+    if STATE_PATH.is_file():
+        try:
+            state = json.loads(STATE_PATH.read_text())
+            state_note = (" (saved restore: enabled="
+                          f"{state.get('night-light-enabled')}, "
+                          f"temp={state.get('night-light-temperature')}K)")
+        except json.JSONDecodeError:
+            state_note = " (saved state: corrupted)"
+
+    print(f"enabled:        {'yes' if ENABLED else 'no'}{env_note}{state_note}")
+    print(f"location:       {LAT}, {LON}")
+    print(f"sunrise:        {_fmt(sunrise)}")
+    print(f"sunset:         {_fmt(sunset)}")
+    print(f"now:            {datetime.now().astimezone().strftime('%-I:%M %p')}")
+
+    try:
+        cur_temp = get_temperature()
+        nl_on = night_light_enabled()
+        print(f"current temp:   {cur_temp}K (Night Light {'on' if nl_on else 'off'})")
+    except subprocess.CalledProcessError:
+        print("current temp:   (unreadable)")
+
+    print(f"start temp:     {START_TEMPERATURE}K")
+    print(f"end temp:       {END_TEMPERATURE}K")
+    print(f"step:           -{TEMP_STEP}K per dismissed nag")
+    print(f"nag interval:   {NAG_INTERVAL} min")
+    print(f"snooze pause:   {SNOOZE_MINUTES} min")
+
+
+def cmd_times():
+    load_env()
+    sunrise, sunset = todays_sun_times()
+    print(f"sunrise {_fmt(sunrise)}  sunset {_fmt(sunset)}")
+
+
+def cmd_test():
+    """Immediate ramp + nag for testing (does not wait for sunset)."""
+    load_env()
+    _save_state()
+    print(f"test: setting Night Light to {START_TEMPERATURE}K")
+    configure_night_light_schedule()
+    set_temperature(START_TEMPERATURE)
+    ensure_gsd_color()
+    print("notification sent -- click Snooze or dismiss")
+
+    was_snoozed = send_nag_notification(START_TEMPERATURE)
+    if was_snoozed:
+        print(f"snoozed -- temperature stays at {START_TEMPERATURE}K")
+        time.sleep(3)
+    else:
+        new_temp = max(END_TEMPERATURE, START_TEMPERATURE - TEMP_STEP)
+        print(f"dismissed -- ramping to {new_temp}K")
+        set_temperature(new_temp)
+        time.sleep(3)
+
+    print("restoring...")
+    _restore_state(delete=False)
+    print("done.")
+
+
+def cmd_on():
+    load_env()
+    _save_state()
+    configure_night_light_schedule()
+    set_temperature(END_TEMPERATURE)
+    ensure_gsd_color()
+    print(f"Night Light forced to {END_TEMPERATURE}K.")
+    print("Run 'sunset-nag off' to restore your previous settings.")
+
+
+def cmd_off():
+    _restore_state()
+    try:
+        _set_key("night-light-enabled", "false")
+    except subprocess.CalledProcessError as e:
+        print(f"could not disable: {e}")
+        return 1
+    print("Night Light disabled.")
+    return 0
+
+
+def main(argv):
+    cmd = argv[1] if len(argv) > 1 else "status"
+    handlers = {
+        "daemon": cmd_daemon,
+        "status": cmd_status,
+        "times": cmd_times,
+        "test": cmd_test,
+        "on": cmd_on,
+        "off": cmd_off,
+    }
+    if cmd not in handlers:
+        print(__doc__)
+        return 2
+    return handlers[cmd]() or 0
+
+
+load_env()
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
