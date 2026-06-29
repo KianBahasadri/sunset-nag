@@ -334,12 +334,14 @@ NAG_MESSAGES = [
 ]
 
 
-def send_nag_notification(temp_k, snooze_count=0):
+def send_nag_notification(temp_k, snooze_count=0, snooze_minutes=None):
     """Show a modal GNOME dialog with Snooze + Emergency buttons.
 
     Returns "snooze" or "emergency" depending on which button was clicked,
     or "" if the dialog was closed/timed out/errored.
     """
+    if snooze_minutes is None:
+        snooze_minutes = SNOOZE_MINUTES
     msg = NAG_MESSAGES[min(snooze_count, len(NAG_MESSAGES) - 1)]
     text = msg
     if snooze_count > 0:
@@ -350,7 +352,7 @@ def send_nag_notification(temp_k, snooze_count=0):
         "--warning",
         "--title", "sunset-nag",
         "--text", text,
-        "--ok-label", f"Snooze {SNOOZE_MINUTES} min",
+        "--ok-label", f"Snooze {snooze_minutes} min",
         "--extra-button", "It\u2019s an emergency",
         "--width", "400",
     ]
@@ -408,12 +410,11 @@ def cmd_daemon():
         nag_start_sunset = None   # the sunset event that started the current nag
         nag_end_sunrise = None    # the sunrise that will end it
 
-        last_nag_time = None
         snoozed_until = None
         current_temp_k = START_TEMPERATURE
         nag_disabled = False      # emergency: suppress nags until sunrise
         snooze_count = 0          # times snoozed this nag period
-        current_interval = NAG_INTERVAL  # shrinks by 1 per snooze, min 1
+        current_snooze = SNOOZE_MINUTES  # snooze pause shrinks by 1 per snooze, min 1
 
         while not stop["flag"]:
             load_env()
@@ -454,11 +455,10 @@ def cmd_daemon():
                 ensure_gsd_color()
                 nag_start_sunset = None
                 nag_end_sunrise = None
-                last_nag_time = None
                 snoozed_until = None
                 nag_disabled = False
                 snooze_count = 0
-                current_interval = NAG_INTERVAL
+                current_snooze = SNOOZE_MINUTES
                 print(f"sunrise -- nag ended ({_fmt(sunrise)})", flush=True)
 
             # Active nag period.
@@ -466,53 +466,49 @@ def cmd_daemon():
                now_utc < nag_end_sunrise and not nag_disabled:
                 ensure_gsd_color()
 
-                if snoozed_until and datetime.now() < snoozed_until:
+                if snoozed_until is not None and datetime.now() < snoozed_until:
                     time.sleep(DAEMON_SLEEP)
                     continue
 
-                if last_nag_time is None or \
-                   (datetime.now() - last_nag_time).total_seconds() \
-                        >= current_interval * 60:
-                    print(f"nag: {current_temp_k}K", flush=True)
-                    action = send_nag_notification(
-                        current_temp_k, snooze_count
-                    )
-                    last_nag_time = datetime.now()
+                print(f"nag: {current_temp_k}K", flush=True)
+                action = send_nag_notification(
+                    current_temp_k, snooze_count, current_snooze
+                )
 
-                    if action == "snooze":
-                        snooze_count += 1
-                        current_interval = max(1, current_interval - 1)
-                        snoozed_until = datetime.now() + \
-                            timedelta(minutes=SNOOZE_MINUTES)
-                        current_temp_k = max(
-                            END_TEMPERATURE, current_temp_k - TEMP_STEP
-                        )
-                        set_temperature(current_temp_k)
-                        print(f"snoozed: ramping to {current_temp_k}K, "
-                              f"pausing {SNOOZE_MINUTES} min, "
-                              f"next nag in {current_interval} min", flush=True)
-                    elif action == "emergency":
-                        _restore_state(delete=False)
-                        try:
-                            _set_key("night-light-enabled", "false")
-                        except subprocess.CalledProcessError:
-                            pass
-                        # Keep the nag window marked active (do NOT null
-                        # nag_start_sunset): nulling it makes the `entered`
-                        # transition re-fire while it is still night and call
-                        # configure_night_light_schedule(), which re-enables
-                        # Night Light seconds later. Suppress nags until
-                        # sunrise with nag_disabled instead.
-                        nag_disabled = True
-                        last_nag_time = None
-                        snoozed_until = None
-                        print("emergency -- Night Light disabled until sunrise",
-                              flush=True)
-                        time.sleep(DAEMON_SLEEP)
-                        continue
-                    else:
-                        print("dismissed -- no action taken", flush=True)
-                    # timeout/error: ignore, will re-nag next cycle
+                if action == "snooze":
+                    snooze_count += 1
+                    snoozed_for = current_snooze
+                    snoozed_until = datetime.now() + \
+                        timedelta(minutes=current_snooze)
+                    current_snooze = max(1, current_snooze - 1)
+                    current_temp_k = max(
+                        END_TEMPERATURE, current_temp_k - TEMP_STEP
+                    )
+                    set_temperature(current_temp_k)
+                    print(f"snoozed: ramping to {current_temp_k}K, "
+                          f"pausing {snoozed_for} min", flush=True)
+                elif action == "emergency":
+                    _restore_state(delete=False)
+                    try:
+                        _set_key("night-light-enabled", "false")
+                    except subprocess.CalledProcessError:
+                        pass
+                    # Keep the nag window marked active (do NOT null
+                    # nag_start_sunset): nulling it makes the `entered`
+                    # transition re-fire while it is still night and call
+                    # configure_night_light_schedule(), which re-enables
+                    # Night Light seconds later. Suppress nags until
+                    # sunrise with nag_disabled instead.
+                    nag_disabled = True
+                    snoozed_until = None
+                    print("emergency -- Night Light disabled until sunrise",
+                          flush=True)
+                    time.sleep(DAEMON_SLEEP)
+                    continue
+                else:
+                    snoozed_until = datetime.now() + timedelta(minutes=current_snooze)
+                    print("dismissed -- pausing {0} min".format(current_snooze), flush=True)
+                # timeout/error: ignore, will re-nag next cycle
 
                 time.sleep(DAEMON_SLEEP)
                 continue

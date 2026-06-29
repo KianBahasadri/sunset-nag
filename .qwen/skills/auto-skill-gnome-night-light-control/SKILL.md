@@ -1,8 +1,8 @@
 ---
 name: gnome-night-light-control
-description: Programmatically control GNOME Night Light on Wayland (schedule-gating gotchas, 24h-manual-schedule recipe, gsd-color management) plus daemon loop design pitfalls for sunset/sunrise-cycled nag daemons, zenity modal-dialog nag alternative to notify-send, per-interaction journald logging, and progressive nag-interval escalation on snooze
+description: Programmatically control GNOME Night Light on Wayland (schedule-gating gotchas, 24h-manual-schedule recipe, gsd-color management) plus daemon loop design pitfalls for sunset/sunrise-cycled nag daemons — zenity modal dialogs, per-interaction journald logging, collapsing snooze duration for escalation, and the dismiss-without-action fall-through bug
 source: auto-skill
-extracted_at: '2026-06-29T02:31:30.763Z'
+extracted_at: '2026-06-29T02:58:00.000Z'
 ---
 
 # GNOME Night Light Control (Wayland / gsettings)
@@ -459,56 +459,105 @@ This covers all four outcomes: nag fired, snoozed (with new temp), emergency, di
 
 **`flush=True` is mandatory.** Python buffers stdout when not attached to a TTY (i.e., under systemd). Without `flush=True`, log lines appear in large bursts only when the buffer fills or the process exits — making live debugging via `journalctl -f` useless.
 
-## Progressive Nag Escalation (interval shrinks per snooze)
+## Progressive Nag Escalation (snooze duration shrinks per snooze)
 
-A fixed `NAG_INTERVAL` is too gentle for a wind-down tool: a user who keeps hitting Snooze is signalling they need *more* pressure, not the same 5-minute gap over and over. Escalate by shrinking the interval by 1 minute on each snooze, floored at 1 minute, so the nags get progressively more insistent:
+A fixed snooze is too gentle for a wind-down tool: a user who keeps hitting Snooze is signalling they need *more* pressure, not the same 5-minute reprieve over and over. Escalate by shrinking the **snooze duration itself** by 1 minute on each snooze, floored at 1 minute, so the nags become progressively more insistent:
 
-- Snooze 1 → next nag in `NAG_INTERVAL - 1` min
-- Snooze 2 → next nag in `NAG_INTERVAL - 2` min
-- …
-- Snooze `NAG_INTERVAL - 1`+ → nagging every 1 min
+- Snooze 1 → pause 5 min, next nag when pause ends
+- Snooze 2 → pause 4 min
+- Snooze 3 → pause 3 min
+- Snooze 4 → pause 2 min
+- Snooze 5+ → pause 1 min (floor)
 
-### Implementation
+### Collapse into one variable — do not use a separate "interval"
 
-Track `current_interval` alongside the other per-period state. Initialize it to `NAG_INTERVAL` at daemon start **and** at sunrise (reset), decrement on each snooze with a floor of 1, and use it in the nag-firing comparison:
+A common first attempt is to keep the snooze pause fixed (`SNOOZE_MINUTES`) and add a second `current_interval` that shrinks — so the nag fires every `current_interval` minutes *after* the snooze ends. This **does not behave as users expect**: the effective gap between nags is `snooze_pause + current_interval`, which starts longer than `SNOOZE_MINUTES` and shrinks unevenly. Worse, the snooze pause always exceeds the shrinking interval, so the interval comparison becomes dead code and the gap is always exactly `SNOOZE_MINUTES`.
+
+**The fix:** drop the separate interval entirely. Make the snooze pause itself the thing that shrinks. The button label (`Snooze N min`) then matches reality: "Snooze N min" means "you get N minutes of peace," and `current_snooze` is the single source of truth.
 
 ```python
-# Initialize with the other per-period trackers:
-current_interval = NAG_INTERVAL
+# Initialize with other per-period trackers:
+current_snooze = SNOOZE_MINUTES
 
-# At sunrise (the `left` transition), reset alongside nag_disabled etc.:
-nag_disabled = False
-snooze_count = 0
-current_interval = NAG_INTERVAL
+# Dialog label reflects reality:
+cmd = ["zenity", ..., "--ok-label", f"Snooze {current_snooze} min", ...]
 
-# In the nag-firing check, use current_interval, NOT NAG_INTERVAL:
-if last_nag_time is None or \
-   (datetime.now() - last_nag_time).total_seconds() >= current_interval * 60:
-    ...
-
-# On snooze, decrement (floor 1), and log the new interval:
+# On snooze: capture, decrement, set pause from the captured value:
 if action == "snooze":
     snooze_count += 1
-    current_interval = max(1, current_interval - 1)
+    snoozed_for = current_snooze                    # capture pre-decrement
+    snoozed_until = datetime.now() + timedelta(minutes=current_snooze)
+    current_snooze = max(1, current_snooze - 1)     # shrink for *next* snooze
     ...
-    print(f"snoozed: ramping to {current_temp_k}K, pausing {SNOOZE_MINUTES} min, "
-          f"next nag in {current_interval} min", flush=True)
+    print(f"snoozed: ramping to {current_temp_k}K, pausing {snoozed_for} min",
+          flush=True)
 ```
+
+When the snooze expires, the daemon re-fires the nag immediately — no separate interval check needed. The gap between nags equals the snooze duration, which shrinks as intended.
 
 ### Why pair it with a snooze counter in the dialog
 
 Escalation is more effective when the user can *see* they're being escalated. Showing the snooze count in the dialog body (only when > 0) gives feedback that the nag is tightening because of *their* choices:
 
 ```python
-def send_nag_notification(temp_k, snooze_count=0):
-    text = "It's bedtime."
+def send_nag_notification(temp_k, snooze_count=0, snooze_minutes=None):
+    if snooze_minutes is None:
+        snooze_minutes = SNOOZE_MINUTES
+    msg = NAG_MESSAGES[min(snooze_count, len(NAG_MESSAGES) - 1)]
+    text = msg
     if snooze_count > 0:
         text += f"\n\nYou've snoozed {snooze_count} time{'s' if snooze_count != 1 else ''}."
-    ...
+    cmd = [..., "--ok-label", f"Snooze {snooze_minutes} min", ...]
 ```
 
-The count also resets at sunrise (`snooze_count = 0`), so each night starts fresh with no guilt-trip from the previous night.
+The count resets at sunrise (`snooze_count = 0`), so each night starts fresh with no carry-over guilt.
 
 ### Reset discipline
 
-Both `current_interval` and `snooze_count` must reset in **the same place** — the sunrise (`left`) transition, alongside `nag_disabled`, `last_nag_time`, etc. Forgetting either one means the escalation (or the counter) carries over into the next night, so a user who snoozed a lot last night starts tonight already at 1-minute nags. Keep all per-period state reset together in one block.
+`current_snooze`, `snooze_count`, and all other per-period state must reset in **the same place** — the sunrise (`left`) transition, alongside `nag_disabled`, `last_nag_time`, etc. Forgetting any one of them means the escalation carries over into the next night, so a user who snoozed a lot last night starts tonight at 1-minute snoozes. Keep all per-period state reset together in one block.
+
+## Dismiss-Without-Action Fall-Through Bug
+
+When a nag dialog has three outcomes (snooze / emergency / dismiss-without-clicking-a-button), the `else` / dismiss branch must either set a pause or `continue` — otherwise the loop sleeps once and immediately re-fires the nag.
+
+**The bug:** after a dismiss, the code falls through to the bottom of the active-nag block:
+
+```python
+if action == "snooze":
+    snoozed_until = datetime.now() + timedelta(minutes=current_snooze)
+    ...
+elif action == "emergency":
+    ...
+    continue                     # ← emergency skips to next iteration
+else:
+    print("dismissed -- no action taken", flush=True)
+    # ← NO continue, NO snoozed_until
+time.sleep(DAEMON_SLEEP)         # ← dismiss hits this sleep
+continue
+```
+
+On the next iteration `snoozed_until` is still `None` or expired, so the nag fires again immediately — producing an annoying ~5-second re-nag loop until a button is actually clicked.
+
+**Two valid fixes:**
+
+1. Treat dismiss as an implicit snooze (no ramp, but same pause):
+
+   ```python
+   else:
+       snoozed_until = datetime.now() + timedelta(minutes=current_snooze)
+       print("dismissed -- no action taken", flush=True)
+   ```
+
+2. Treat dismiss as "ignore, try again in a moment" with an explicit `continue` and skip the bottom sleep:
+
+   ```python
+   else:
+       print("dismissed -- no action taken", flush=True)
+       continue
+   ```
+
+Option 1 is usually what users want: dismissing the dialog should still buy them a breathing period, just not a warmer screen. Option 2 is appropriate only if dismiss should be punished aggressively.
+
+### Audit checklist after removing a timing guard
+
+Whenever you remove a rate-limiting condition (e.g. replacing `last_nag_time is None or elapsed >= interval * 60` with a snooze-only gate), audit the `else`/dismiss branch and any remaining assignments to the now-unused variable. If `last_nag_time` is written but never read anywhere, delete it — dead assignments confuse reviewers and mask the real state machine.
