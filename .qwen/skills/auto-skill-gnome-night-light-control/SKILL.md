@@ -1,8 +1,8 @@
 ---
 name: gnome-night-light-control
-description: Programmatically control GNOME Night Light on Wayland (schedule-gating gotchas, 24h-manual-schedule recipe, gsd-color management) plus daemon loop design pitfalls for sunset/sunrise-cycled nag daemons
+description: Programmatically control GNOME Night Light on Wayland (schedule-gating gotchas, 24h-manual-schedule recipe, gsd-color management) plus daemon loop design pitfalls for sunset/sunrise-cycled nag daemons, zenity modal-dialog nag alternative to notify-send, per-interaction journald logging, and progressive nag-interval escalation on snooze
 source: auto-skill
-extracted_at: '2026-06-28T17:13:00.796Z'
+extracted_at: '2026-06-29T02:31:30.763Z'
 ---
 
 # GNOME Night Light Control (Wayland / gsettings)
@@ -372,3 +372,143 @@ and the `left` (sunrise) transition clears `nag_disabled = False` alongside the 
 **Why `delete=False`:** the daemon keeps running after an emergency and will mutate gsettings again (next sunset). Restoring without deleting keeps the original-settings backup on disk so a crash before sunrise can still restore; deleting it here leaves the rest of the run unbacked-up.
 
 **Common bug (the other extreme):** restoring state + disabling Night Light but leaving every tracker non-`None` and adding no suppression flag. The active-nag branch is still gated on `nag_start_sunset is not None`, so the daemon keeps re-nagging every `NAG_INTERVAL` despite the emergency. The `nag_disabled` flag is the minimal addition that suppresses nags *without* triggering `entered` re-entry — do not try to avoid it by nulling `nag_start_sunset`.
+
+## zenity Modal Dialogs as a Nag Alternative
+
+`notify-send` produces a passive notification bubble that the user can easily ignore. For a nag tool whose entire purpose is to be hard to ignore, `zenity` modal dialogs are a stronger choice — they produce a real popup window that stays on top until dismissed. This is a drop-in replacement: the caller still gets back `"snooze"`, `"emergency"`, or `""`.
+
+### zenity's return pattern differs from notify-send
+
+This is the main gotcha when swapping. zenity splits the result across **both stdout and exit code**, unlike notify-send which puts everything on stdout:
+
+| Outcome | stdout | exit code |
+|---------|--------|-----------|
+| OK button (`--ok-label`) clicked | empty | 0 |
+| Extra button (`--extra-button`) clicked | the button's label | non-zero |
+| Window closed (X) / timeout | empty | non-zero |
+
+So you must check stdout content first, then fall back to exit code — checking only the exit code conflates "extra button" with "closed":
+
+```python
+def send_nag_notification(temp_k):
+    cmd = [
+        "zenity", "--warning",
+        "--title", "sunset-nag",
+        "--text", f"Time to wind down \u2600\ufe0f\nScreen is {temp_k}K.",
+        "--ok-label", f"Snooze {SNOOZE_MINUTES} min",
+        "--extra-button", "It\u2019s an emergency",
+        "--width", "400",
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return ""
+    out = result.stdout.strip()
+    if "emergency" in out.lower():
+        return "emergency"
+    if result.returncode == 0:
+        return "snooze"
+    return ""   # dismissed without a button
+```
+
+### Tradeoffs vs notify-send
+
+| Aspect | notify-send | zenity |
+|--------|-------------|--------|
+| Visibility | Passive bubble, easy to ignore | Modal window, must dismiss |
+| Auto-expiry | Yes (unless `-w` resident) | No — blocks until clicked |
+| Action buttons | `-A key=Label`, stdout = key | `--ok-label` + `--extra-button`, stdout = label |
+| Return parsing | stdout string only | stdout + exit code combined |
+| Best for | Gentle reminders | Hard nags that must be acknowledged |
+
+zenity has no silent-expiry path — the dialog blocks until the user interacts. For a nag tool this is a feature (harder to ignore); for a background daemon it means the loop is paused until dismissal, so the dialog stays on screen across `NAG_INTERVAL` boundaries rather than stacking up.
+
+### POC test before integrating
+
+Before swapping into a daemon, test zenity directly to verify the dialog renders and the return pattern matches expectations:
+
+```bash
+zenity --warning --title="sunset-nag" \
+  --text="Time to wind down \u2600\ufe0f\nScreen is 4000K." \
+  --ok-label="Snooze 5 min" \
+  --extra-button="It's an emergency" \
+  --width=400; echo "exit: $?"
+```
+
+Click each button and observe stdout + exit code. Only swap the daemon's `send_nag_notification` once the return mapping is confirmed.
+
+## Logging Each Nag Interaction
+
+A nag daemon running under systemd only logs stdout via journald (`journalctl --user -u <service> -f`). If the daemon only prints on sunset/sunrise transitions, you **cannot tell from the logs** whether nags are firing, whether the user is snoozing, or whether the dialog is silently erroring. Log every interaction:
+
+```python
+print(f"nag: {current_temp_k}K", flush=True)        # before sending the dialog
+action = send_nag_notification(current_temp_k)
+if action == "snooze":
+    ...
+    set_temperature(current_temp_k)
+    print(f"snoozed: ramping to {current_temp_k}K, pausing {SNOOZE_MINUTES} min",
+          flush=True)
+elif action == "emergency":
+    print("emergency -- Night Light disabled until sunrise", flush=True)
+else:
+    print("dismissed -- no action taken", flush=True)
+```
+
+This covers all four outcomes: nag fired, snoozed (with new temp), emergency, dismissed-without-a-button.
+
+**`flush=True` is mandatory.** Python buffers stdout when not attached to a TTY (i.e., under systemd). Without `flush=True`, log lines appear in large bursts only when the buffer fills or the process exits — making live debugging via `journalctl -f` useless.
+
+## Progressive Nag Escalation (interval shrinks per snooze)
+
+A fixed `NAG_INTERVAL` is too gentle for a wind-down tool: a user who keeps hitting Snooze is signalling they need *more* pressure, not the same 5-minute gap over and over. Escalate by shrinking the interval by 1 minute on each snooze, floored at 1 minute, so the nags get progressively more insistent:
+
+- Snooze 1 → next nag in `NAG_INTERVAL - 1` min
+- Snooze 2 → next nag in `NAG_INTERVAL - 2` min
+- …
+- Snooze `NAG_INTERVAL - 1`+ → nagging every 1 min
+
+### Implementation
+
+Track `current_interval` alongside the other per-period state. Initialize it to `NAG_INTERVAL` at daemon start **and** at sunrise (reset), decrement on each snooze with a floor of 1, and use it in the nag-firing comparison:
+
+```python
+# Initialize with the other per-period trackers:
+current_interval = NAG_INTERVAL
+
+# At sunrise (the `left` transition), reset alongside nag_disabled etc.:
+nag_disabled = False
+snooze_count = 0
+current_interval = NAG_INTERVAL
+
+# In the nag-firing check, use current_interval, NOT NAG_INTERVAL:
+if last_nag_time is None or \
+   (datetime.now() - last_nag_time).total_seconds() >= current_interval * 60:
+    ...
+
+# On snooze, decrement (floor 1), and log the new interval:
+if action == "snooze":
+    snooze_count += 1
+    current_interval = max(1, current_interval - 1)
+    ...
+    print(f"snoozed: ramping to {current_temp_k}K, pausing {SNOOZE_MINUTES} min, "
+          f"next nag in {current_interval} min", flush=True)
+```
+
+### Why pair it with a snooze counter in the dialog
+
+Escalation is more effective when the user can *see* they're being escalated. Showing the snooze count in the dialog body (only when > 0) gives feedback that the nag is tightening because of *their* choices:
+
+```python
+def send_nag_notification(temp_k, snooze_count=0):
+    text = "It's bedtime."
+    if snooze_count > 0:
+        text += f"\n\nYou've snoozed {snooze_count} time{'s' if snooze_count != 1 else ''}."
+    ...
+```
+
+The count also resets at sunrise (`snooze_count = 0`), so each night starts fresh with no guilt-trip from the previous night.
+
+### Reset discipline
+
+Both `current_interval` and `snooze_count` must reset in **the same place** — the sunrise (`left`) transition, alongside `nag_disabled`, `last_nag_time`, etc. Forgetting either one means the escalation (or the counter) carries over into the next night, so a user who snoozed a lot last night starts tonight already at 1-minute nags. Keep all per-period state reset together in one block.
