@@ -2,9 +2,10 @@
 """sunset-nag: nag yourself off the computer at sunset.
 
 At sunset, enables GNOME Night Light at a mild warm temperature, then ramps the
-screen progressively hotter while nagging with a desktop notification every
-N minutes (controlled by NAG_INTERVAL). Clicking "Snooze" ramps the temperature
-warmer and pauses for SNOOZE_MINUTES before the next nag. Clicking "It's an
+screen progressively hotter while nagging with a modal dialog. Snoozing or
+dismissing pauses for SNOOZE_MINUTES before the next nag; each Snooze also ramps
+the temperature warmer and shrinks the next pause by one minute (down to a floor
+of 1 minute), so the nagging speeds up the longer you stay up. Clicking "It's an
 emergency" disables Night Light for the rest of the night so you can keep
 working. Sunrise disables Night Light and restores whatever you had before.
 
@@ -46,7 +47,6 @@ _DEFAULT_END_TEMPERATURE = 1800
 _DEFAULT_TEMP_STEP = 200
 
 # Nag cadence.
-_DEFAULT_NAG_INTERVAL = 5          # minutes between notifications
 _DEFAULT_SNOOZE_MINUTES = 5        # how long Snooze pauses the ramp
 
 _DEFAULT_ENABLED = True
@@ -66,7 +66,6 @@ SUN_ALTITUDE = _DEFAULT_SUN_ALTITUDE
 START_TEMPERATURE = _DEFAULT_START_TEMPERATURE
 END_TEMPERATURE = _DEFAULT_END_TEMPERATURE
 TEMP_STEP = _DEFAULT_TEMP_STEP
-NAG_INTERVAL = _DEFAULT_NAG_INTERVAL
 SNOOZE_MINUTES = _DEFAULT_SNOOZE_MINUTES
 ENABLED = _DEFAULT_ENABLED
 
@@ -81,7 +80,7 @@ def _parse_bool(value):
 
 def load_env():
     global LAT, LON, SUN_ALTITUDE, START_TEMPERATURE, END_TEMPERATURE, \
-           TEMP_STEP, NAG_INTERVAL, SNOOZE_MINUTES, ENABLED
+           TEMP_STEP, SNOOZE_MINUTES, ENABLED
 
     values = {
         "LAT": _DEFAULT_LAT,
@@ -90,7 +89,6 @@ def load_env():
         "START_TEMPERATURE": _DEFAULT_START_TEMPERATURE,
         "END_TEMPERATURE": _DEFAULT_END_TEMPERATURE,
         "TEMP_STEP": _DEFAULT_TEMP_STEP,
-        "NAG_INTERVAL": _DEFAULT_NAG_INTERVAL,
         "SNOOZE_MINUTES": _DEFAULT_SNOOZE_MINUTES,
         "ENABLED": _DEFAULT_ENABLED,
     }
@@ -113,7 +111,6 @@ def load_env():
     START_TEMPERATURE = int(float(values["START_TEMPERATURE"]))
     END_TEMPERATURE = int(float(values["END_TEMPERATURE"]))
     TEMP_STEP = int(float(values["TEMP_STEP"]))
-    NAG_INTERVAL = int(float(values["NAG_INTERVAL"]))
     SNOOZE_MINUTES = int(float(values["SNOOZE_MINUTES"]))
 
     if "DISABLED" in values:
@@ -387,7 +384,7 @@ def cmd_daemon():
     print(f"sunset-nag daemon started "
           f"(ramp {START_TEMPERATURE}\u2192{END_TEMPERATURE}K, "
           f"step -{TEMP_STEP}, "
-          f"nag every {NAG_INTERVAL} min, snooze {SNOOZE_MINUTES} min, "
+          f"snooze {SNOOZE_MINUTES} min, "
           f"enabled {'yes' if ENABLED else 'no'})", flush=True)
 
     # If a previous run left a saved state (e.g., after a crash), restore it
@@ -553,8 +550,16 @@ def cmd_status():
     print(f"start temp:     {START_TEMPERATURE}K")
     print(f"end temp:       {END_TEMPERATURE}K")
     print(f"step:           -{TEMP_STEP}K per Snooze")
-    print(f"nag interval:   {NAG_INTERVAL} min")
-    print(f"snooze pause:   {SNOOZE_MINUTES} min")
+
+    # The snooze pause starts at SNOOZE_MINUTES and shrinks by 1 minute after
+    # each Snooze, down to a floor of 1 minute -- mirror that ramp here.
+    pause_seq = []
+    s = SNOOZE_MINUTES
+    for _ in range(max(SNOOZE_MINUTES, 1) + 1):
+        pause_seq.append(str(s))
+        s = max(1, s - 1)
+    print(f"snooze pause:   {' → '.join(pause_seq)} → ... min "
+          f"(shrinks 1 per snooze, floor 1)")
 
 
 def cmd_times():

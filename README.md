@@ -20,10 +20,12 @@ Light is controlled via `gsettings`.
 - After sunset, the script enables Night Light, overrides the schedule to cover
   24 h (so GNOME applies the colour shift regardless of its own sunset calc),
   and starts the nag loop.
-- The loop checks every few seconds. When `NAG_INTERVAL` minutes have passed, it
-  sends a notification via `notify-send` with two action buttons:
+- The loop checks every few seconds and shows a modal dialog with two buttons:
   - **Snooze:** the temperature ramps `TEMP_STEP` K warmer (down to `END_TEMPERATURE`),
-    then pauses for `SNOOZE_MINUTES` before the next nag.
+    then pauses before the next nag. The pause starts at `SNOOZE_MINUTES` and
+    shrinks by 1 minute after each Snooze (floor of 1 minute), so the nagging
+    speeds up the longer you stay up. Dismissing the dialog pauses the same
+    amount without ramping the temperature.
   - **It's an emergency:** Night Light is disabled for the rest of the night and
     the daemon goes back to idle until the next sunset. Use sparingly.
 - The daemon idles through the day and only activates between sunset and sunrise.
@@ -43,8 +45,7 @@ SUN_ALTITUDE=-0.833          # standard; use -6 for civil twilight
 START_TEMPERATURE=4000       # K applied at sunset (mild amber)
 END_TEMPERATURE=1800         # K floor (deep lava-orange)
 TEMP_STEP=200                # K ramp per Snooze
-NAG_INTERVAL=5               # minutes between notifications
-SNOOZE_MINUTES=5             # pause duration after clicking Snooze
+SNOOZE_MINUTES=5             # pause before next nag; shrinks 1 min per Snooze (floor 1)
 ```
 
 ## Install
